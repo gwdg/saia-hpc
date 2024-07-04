@@ -1,0 +1,14 @@
+{
+    "services": [
+        {
+            "name": "example-service",
+            "type": "LLM",
+            "sbatch": "./sbatch/example-service.sbatch",
+            "chunk_size": 8,
+            "inferences_per_instance": 1,
+            "maximum_number_instances": 10,
+            "minimum_number_instances": 1,
+            "job_expiry_time": "9:00"
+        }
+    ]
+}

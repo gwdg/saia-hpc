@@ -1,0 +1,17 @@
+nohup*
+_*
+
+__pycache__/
+
+old/
+
+venv/
+
+api.json
+models.json
+
+*.service
+*.services
+*.env
+*.lock
+.last_update
