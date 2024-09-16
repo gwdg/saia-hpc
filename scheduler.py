@@ -40,7 +40,7 @@ LAST_INTERVAL_WEIGHT = 2 # Multiplier for number of active inferences in recent 
 def get_squeue_status():
     squeue_output = subprocess.run(
         [squeue_path, '--me', '-h', '--name=service-backend',
-         '--format="{\"JOBID\": \"%.18i\", \"STATE\": \"%.2t\", \"TIME\": \"%.10M\", \"TIME_LIMIT\": \"%.9l\", \"NODELIST\": \"%N\"}"'],
+         '--format="{\"JOBID\": \"%.18i\", \"STATE\": \"%.2t\", \"TIME\": \"%.10M\", \"TIME_LIMIT\": \"%.9l\", \"BATCHHOST\": \"%B\"}"'],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode('utf-8')
     lines = squeue_output.split("\n")
     lines = [" ".join(line.split()).strip("\"") for line in lines]
@@ -57,12 +57,22 @@ def generate_random_port_number(excluded: set) -> int:
 
 
 def squeue_time_to_timedelta(time_str):
-    try:
-        minutes, seconds = map(int, time_str.split(':'))
-    except:
-        hours, minutes, seconds = map(int, time_str.split(':'))
-        return timedelta(hours=hours, minutes=minutes, seconds=seconds)
-    return timedelta(minutes=minutes, seconds=seconds)
+    if '-' in time_str:
+        days_part, time_part = time_str.split('-')
+        days = int(days_part)
+        # Process the rest as hours:minutes:seconds
+        hours, minutes, seconds = map(int, time_part.split(':'))
+    else:
+        days = 0
+        time_parts = time_str.split(':')
+        if len(time_parts) == 2:  # MM:SS
+            hours = 0
+            minutes, seconds = map(int, time_parts)
+        elif len(time_parts) == 3:  # HH:MM:SS
+            hours, minutes, seconds = map(int, time_parts)
+        else:
+            raise ValueError("Invalid time format: {time_str}")
+    return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
 
 
 def test_readiness(host, port):
@@ -112,7 +122,7 @@ class ServiceJob:
         self.status = squeue_json["STATE"].strip()
         self.time = squeue_json["TIME"].strip()
         self.time_limit = squeue_json["TIME_LIMIT"].strip()
-        self.host = squeue_json["NODELIST"].strip()
+        self.host = squeue_json["BATCHHOST"].strip()
 
     def is_about_to_expire(self):
         #time = squeue_time_to_timedelta(self.time)

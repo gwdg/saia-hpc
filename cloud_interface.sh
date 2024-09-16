@@ -28,7 +28,7 @@ then
     # Check if last_execution_time file exists
     if [ -f last_update ]; then
         # Read the last execution time from the file
-        last_update=$(cat .last_update)
+        last_update=$(cat last_update)
     else
         # If the file doesn't exist, initialize the last execution time to 0
         last_update=0
