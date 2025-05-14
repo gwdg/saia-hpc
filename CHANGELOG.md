@@ -1,5 +1,10 @@
 # Changelog
 
+## Version: v0.4.1
+### Highlights
+- Updated README.md
+- Minor code refactor
+
 ## Version: v0.4.0
 ### Refactored
 - Major code refactor to improve maintainability and structure.
