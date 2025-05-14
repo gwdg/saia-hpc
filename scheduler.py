@@ -15,23 +15,25 @@ import time
 from datetime import timedelta, datetime
 import random
 import http.client
+from scheduler_core.services import Service, ServiceList, ServiceJob, service_dir, cluster_file, TIME_FORMAT, squeue_time_to_timedelta
 
 ##############################################################################
 ## Configuration                                                            ##
 ##############################################################################
 
-log_filepath = os.path.expanduser('./log/scheduler.log')
+# Get the current month and year
+current_month = datetime.now().strftime("%Y-%m")
+
+# Create the log filepath with the current month
+log_filepath = os.path.expanduser(f"./log/scheduler-{current_month}.log")
 config_file = "config.json"
-service_dir = "./services"
-cluster_file = "cluster.services"
 squeue_path = '/usr/local/slurm/current/install/bin/squeue'
 sbatch_path = '/usr/local/slurm/current/install/bin/sbatch'
+scancel_path = '/usr/local/slurm/current/install/bin/scancel'
 EXPIRE_LIMIT = "9:30"
 FILE_LOCK = ".scheduler.lock"
 MIN_PORT = 61001
 MAX_PORT = 62000
-VALID_STATES = {"R", "PD", "S", "CF"}
-TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 ROUTINE_INTERVAL = 5     # Period of check_routine
 ROUTINE_WINDOW = 60      # For moving average
 LAST_INTERVAL_WEIGHT = 2 # Multiplier for number of active inferences in recent interval
@@ -56,15 +58,6 @@ def generate_random_port_number(excluded: set) -> int:
             return random_number
 
 
-def squeue_time_to_timedelta(time_str):
-    try:
-        minutes, seconds = map(int, time_str.split(':'))
-    except:
-        hours, minutes, seconds = map(int, time_str.split(':'))
-        return timedelta(hours=hours, minutes=minutes, seconds=seconds)
-    return timedelta(minutes=minutes, seconds=seconds)
-
-
 def test_readiness(host, port):
     # Check if a backend is reachable
     # Consider implementing this as async to run readiness probes concurrently
@@ -79,183 +72,61 @@ def test_readiness(host, port):
     return False
 
 
-class ServiceJob:
-    def __init__(self):
-        self.jobid = None
-        self.host = None
-        self.status = None
-        self.started_time = None # When it was submitted
-        self.job_start_time = None # timestamp taken by scheduler
-        self.job_ready_time = None
-        self.job_expiry_time = None
-        self.time = None # According to Slurm
-        self.time_limit = None
-        self.port = None
-        self.ready = None
+def restart_job(jobid):
+    # Restart a job by requeueing it
+    jobid = str(jobid)
+    result = subprocess.run(['scontrol', 'requeue', jobid], capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Job {jobid} requeued successfully.")
+        logging.info(f"Job {jobid} requeued successfully.")
+    else:
+        print(f"Failed to requeue job{jobid}.")
+        logging.error(f"Failed to requeue job{jobid}.")
+        print(f"Error: {result.stderr}")
+        logging.error(f"Error: {result.stderr}")
 
-    def from_json(self, data):
-        self.jobid = data["jobid"]
-        # self.host = data["host"]
-        # self.status = data["status"]
-        self.started_time = data["started_time"]
-        # self.time = data["time"]
-        # self.time_limit = data["time_limit"]
-        self.port = data["port"]
-        self.ready = data["ready"]
-        self.job_start_time = data["job_start_time"]
-        self.job_ready_time = data["job_ready_time"]
-        self.job_expiry_time = data["job_expiry_time"]
 
-    def from_squeue(self, squeue_line):
-        squeue_json = json.loads(squeue_line)
-        # self.jobid = squeue_json["JOBID"]
-        self.status = squeue_json["STATE"].strip()
-        self.time = squeue_json["TIME"].strip()
-        self.time_limit = squeue_json["TIME_LIMIT"].strip()
-        self.host = squeue_json["NODELIST"].strip()
+def cancel_job(jobid):
+    """Cancel a job using its job ID and remove it from the list."""
+    jobid = str(jobid)
+    # Use subprocess to cancel the job via slurm command
+    result = subprocess.run([scancel_path, jobid], capture_output=True, text=True)
+    if result.returncode == 0:
+        logging.info(f"Job {jobid} canceled successfully.")
+    else:
+        logging.error(f"Failed to cancel job {jobid}. Error: {result.stderr}")
 
-    def is_about_to_expire(self):
-        #time = squeue_time_to_timedelta(self.time)
-        # TODO: Fix it for long queue times, just an approximation
-        if self.job_start_time is not None:
-            start = datetime.strptime(self.job_start_time, TIME_FORMAT)
-        else:
-            return False
-        time_limit = squeue_time_to_timedelta(self.time_limit)
-        expire_time = squeue_time_to_timedelta(self.job_expiry_time)
-        current_time = datetime.now()
-        passed_time = current_time - start
-        remaining_time = time_limit - passed_time
-        if remaining_time < expire_time:
-            return True
+
+def check_service_job_status(host, port):
+    command = ['curl', '-i', f'{host}:{port}/health', '--max-time', '20']
+    result = subprocess.run(command, capture_output=True, text=True)
+    if "HTTP/1.1 200 OK" in result.stdout or "HTTP/1.1 404 Not Found" in result.stdout:
+        return True
+    else:
+        logging.info("Found unhealthy job: " + str(host) + ":" + str(port))
         return False
 
-    def to_json(self):
-        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
 
+def start_service_job(service_id, max_retries, retry_delay):
+    """
+    service_id: str
+    Start a new service job for a given service id.
+    """
+    logging.info(f"Starting on-demand service job for {service_id}")
+    scale_to_zero = True
+    max_retries = 5
+    retry_delay = 2  # seconds
+    for attempt in range(max_retries):
+        success = check_routine(service_id, scale_to_zero)
+        if success:
+            logging.info(f"Successfully started service job for {service_id} on attempt {attempt + 1}")
+            return
+        else:
+            if attempt < max_retries - 1:
+                logging.warning(f"Attempt {attempt + 1} to start service job for {service_id} failed due to lock. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+    logging.error(f"Failed to start service job for {service_id} after {max_retries} attempts due to scheduler lock.")
 
-class Service:
-    def __init__(self):
-        service_job: list[ServiceJob]
-        self.name = None
-        self.type = None
-        self.last_updated = None
-        self.sbatch_path = None
-        self.chunk_size = 8
-        self.target_number_instances = 0
-        self.minimum_number_instances = 1
-        self.maximum_number_instances = 10
-        self.inferences_per_instance = 5
-        self.service_jobs = []
-        self.number_required_jobs = 0
-        self.average_inferences = 0
-        self.job_expiry_time = None
-
-    def calculate_active_service_jobs(self):
-        active_jobs = 0
-        for service_job in self.service_jobs:
-            if not service_job.is_about_to_expire():
-                active_jobs += 1
-        return active_jobs
-
-    def get_active_inferences(self):
-        """Returns the number of active processes for this service"""
-        # Command:  ps aux | grep {app} | wc -l
-        cmd = f"ps aux | grep {self.name} | wc -l"
-        # Run the subprocess and get the result
-        ps_output = subprocess.run(cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).stdout.decode('utf-8').strip()
-        # Because subprocess, there are two greps
-        if len(ps_output) > 0: 
-            return int(ps_output) - 2
-        logging.error("Failed to get ps output")
-        return 0
-
-    def get_unready_jobs(self):
-        unready_jobs = []
-        for service_job in self.service_jobs:
-            if service_job.status == "R" and not service_job.ready:
-                unready_jobs.append(service_job)
-                if service_job.job_start_time is None:
-                    service_job.job_start_time = datetime.now().strftime(TIME_FORMAT)
-        return unready_jobs
-
-    def drop_expired_jobs(self):
-        expired_jobs = []
-        for service_job in self.service_jobs:
-            if service_job.status not in VALID_STATES:
-                expired_jobs.append(service_job)
-        for service_job in expired_jobs:
-            self.service_jobs.remove(service_job)
-            logging.debug(f'Dropping job:\n{service_job.to_json()}')
-
-    def to_json(self):
-        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
-
-    def from_json(self, data):
-        self.name = data['name']
-        self.type = data['type']
-        self.chunk_size = data['chunk_size']
-        self.target_number_instances = data['target_number_instances']
-        self.minimum_number_instances = data['minimum_number_instances']
-        self.maximum_number_instances = data['maximum_number_instances']
-        self.inferences_per_instance = data['inferences_per_instance']
-        self.sbatch_path = data['sbatch_path']
-        self.job_expiry_time = data['job_expiry_time']
-        self.number_required_jobs = 0
-        self.last_updated = data['last_updated']
-        self.average_inferences = data['average_inferences']
-        for service_job_data in data['service_jobs']:
-            job = ServiceJob()
-            job.from_json(service_job_data)
-            self.service_jobs.append(job)
-
-class ServiceList:
-    def __init__(self):
-        services: list[Service]
-        self.services = []
-        self.last_updated = None
-
-    def get_all_ports(self):
-        ports = set()
-        for service in self.services:
-            for service_job in service.service_jobs:
-                ports.add(service_job.port)
-        return ports
-
-    def save_to_file(self, update_services = True):
-        self.last_updated = datetime.now().strftime(TIME_FORMAT)
-        json_data = self.to_json()
-        with open(os.path.join(service_dir, cluster_file), "w") as f:
-            f.write(json_data)
-        # Write service files for cloud_interface
-        if update_services:
-            for s in self.services:
-                with open(os.path.join(service_dir, f"{s.name}.service"), "w") as f:
-                    f.write('BACKENDS=(' + ' '.join([f'"{j.host}:{j.port}"' for j in s.service_jobs if j.ready and j.host is not None]) + ')')
-
-    def update_service_job_from_queue(self, squeue_output):
-        for line in squeue_output:
-            if len(line) == 0:
-                continue
-            # Match running jobs to service_jobs via jobid
-            line_dict = json.loads(line)
-            jobid = int(line_dict["JOBID"].strip())
-            service_job = match_jobid_to_service_job(jobid, self)
-            if service_job is None:
-                # logging.warning(f"Job with ID {jobid} is not accounted for.")
-                continue
-            # Update service_job information
-            service_job.from_squeue(line)
-
-    def to_json(self):
-        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
-
-    def from_json(self, data):
-        for service_dict in data["services"]:
-            service = Service()
-            service.from_json(service_dict)
-            self.services.append(service)
 
 def is_running(pid):
     # Check if a given process id is running
@@ -298,14 +169,6 @@ def release_lock():
         return False
 
 
-def match_jobid_to_service_job(jobid, service_list):
-    for service in service_list.services:
-        for service_job in service.service_jobs:
-            if service_job.jobid == jobid:
-                return service_job
-    return None
-
-
 def main():
     logging.basicConfig(filename=log_filepath, level=logging.INFO,
                         format='%(asctime)s.%(msecs)d %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -316,8 +179,13 @@ def main():
         return
     if sys.argv[1] == 'check_routine':
         return check_routine()
+    if sys.argv[1] == 'health_check':
+        return health_check()
     if sys.argv[1] == 'init':
         return init()
+    if sys.argv[1] == 'start_service_job' and len(sys.argv) >= 3:
+        service_id = sys.argv[2]
+        return start_service_job(service_id, max_retries=3, retry_delay=4)
     if len(sys.argv) < 5:
         ## ERROR: Invalid arguments
         return
@@ -331,14 +199,14 @@ def main():
         print(str(e))
 
 
-def check_routine():
+def check_routine(service_id="", scale_to_zero=False):
     """Routine called every 60 seconds or so. Schedules the running backend jobs"""
     logging.debug('Checking routine.')
     lock_acquired = False
     try:
         # Create a mutex via a file signaling that check_routine is already running
         if not acquire_lock():
-            return
+            return False
         lock_acquired = True
         # Read cluster.json and create Service and ServiceJob objects from it
         with open(os.path.join(service_dir, cluster_file), 'r') as f:
@@ -347,7 +215,7 @@ def check_routine():
         service_list = ServiceList()
         service_list.from_json(json_data)
         logging.debug(f'Loaded service list from json\n{json_data}')
-        
+
         # Check status of running jobs
         squeue_output = get_squeue_status()
         logging.debug(f"Current running jobs:\n{squeue_output}")
@@ -358,22 +226,22 @@ def check_routine():
         for service in service_list.services:
             service.drop_expired_jobs()
         logging.debug('Finished dropping expired jobs.')
-        
+
         # Compare number of running jobs to target number
         for service in service_list.services:
             # Calculate number of active service jobs
             active_jobs = service.calculate_active_service_jobs()
-            
+
             # Update the average number of inferences
             active_inferences = service.get_active_inferences()
             logging.debug(f'Has {active_inferences} active inferences.')
 
             ## If 1 backend -> 10 open inferences at each given time
-            
+
             intervals_in_window = ROUTINE_WINDOW / ROUTINE_INTERVAL # 12
             remain_window_weight = intervals_in_window - LAST_INTERVAL_WEIGHT  # 12 - 2 = 10
             weighted_sum = service.average_inferences * remain_window_weight + \
-                LAST_INTERVAL_WEIGHT * active_inferences                       # weighed_sum = avg_inf * 10 + 2 * active_inf 
+                LAST_INTERVAL_WEIGHT * active_inferences                       # weighed_sum = avg_inf * 10 + 2 * active_inf
             service.average_inferences = weighted_sum / intervals_in_window    # weighted_sum / 12
             # Round
             service.average_inferences = round(service.average_inferences, 4)
@@ -391,23 +259,28 @@ def check_routine():
             service.number_required_jobs = number_required_jobs
             logging.debug(f'Has {active_jobs} active jobs. Target is {service.target_number_instances}')
             if number_required_jobs > 0:
-                logging.info(f'Determined that service {service.name} requires {str(number_required_jobs)} additional jobs.')
+                logging.info(f'Determined that service {service.id} requires {str(number_required_jobs)} additional jobs.')
+            elif scale_to_zero and service.id == service_id and service.minimum_number_instances == 0 and active_jobs == 0:
+                service.number_required_jobs = 1
+                logging.info(f'Changed number of required jobs for service {service.id} to 1.')
 
         # Start new jobs equal to the difference and record the job ids
         occupied_ports = service_list.get_all_ports()
         logging.debug(f'The following ports are already occupied: {str(list(occupied_ports))}')
         new_jobs = []
         for service in service_list.services:
+            if service.maximum_number_instances == 0:
+                logging.info(f"Service {service.id} is set to zero maximum instances. Skipping automatic job creation.")
+                continue
             for _ in range(service.number_required_jobs):
                 logging.debug("Starting new job")
                 port = generate_random_port_number(occupied_ports)
                 # Pass the config and port number to use when calling sbatch to backend.sbatch
                 batch_output = subprocess.run(
-                    [sbatch_path, service.sbatch_path,
-                     f'{service.type}/{service.name}', f"{str(port)}"],
+                    [sbatch_path, service.sbatch_path, f"{str(port)}"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode('utf-8')
                 jobid = int(batch_output.strip())
-                logging.info(f'Submitted new job with for {service.type}/{service.name} {str(port)}'
+                logging.info(f'Submitted a new job for {service.id} on port {str(port)}'
                              f' and received jobid {jobid}')
                 new_service_job = ServiceJob()
                 new_service_job.jobid = jobid
@@ -423,8 +296,10 @@ def check_routine():
         service_list.save_to_file()
 
         unready_jobs = []
+        # pd_jobs = []
         for service in service_list.services:
             unready_jobs += service.get_unready_jobs()
+            # pd_jobs += service.get_pd_jobs()
 
         if len(unready_jobs) > 0:
             logging.debug(f'Check if {len(unready_jobs)} are ready.\nThis includes'
@@ -437,12 +312,45 @@ def check_routine():
                     ready_jobs.append(unready_job)
                     logging.info(f'Job {unready_job.jobid} is now ready.')
                     unready_job.job_ready_time = datetime.now().strftime(TIME_FORMAT)
+
+                # Handle jobs that are running but not ready for a long time
+                if unready_job.ready == False:
+                    job_start_time = datetime.strptime(unready_job.job_start_time, TIME_FORMAT)
+                    job_ready_time_limit = squeue_time_to_timedelta(unready_job.job_expiry_time) * 1.5
+                    print(job_ready_time_limit)
+                    print(job_start_time)
+                    if datetime.now() - job_start_time > job_ready_time_limit:
+                        logging.warning(f'Job {unready_job.jobid} exceeded ready time limit and will be marked as failed.')
+                        cancel_job(unready_job.jobid)
+                        unready_job.job_ready_time = datetime.now().strftime(TIME_FORMAT)
+
+
             for ready_job in ready_jobs:
                 unready_jobs.remove(ready_job)
 
             squeue_output = get_squeue_status()
             service_list.update_service_job_from_queue(squeue_output)
             logging.debug(f"Current running jobs:\n{squeue_output}")
+
+        # Handle jobs that are running but not ready for a long time
+        # if len(pd_jobs) > 0:
+        #     # get current time
+        #     current_time = datetime.now().strftime(TIME_FORMAT)
+        #     for pd_job in pd_jobs:
+        #         # convert job_start_time to datetime
+        #         job_start_time = datetime.strptime(pd_job.job_start_time, TIME_FORMAT)
+        #         job_ready_time = squeue_time_to_timedelta(pd_job.job_expiry_time) * 1.5
+        #         # check if job has exceeded ready time limit
+        #         if current_time - job_start_time > job_ready_time and service.service_jobs.status == "PD":
+        #             logging.warning(f'Job {pd_job.jobid} exceeded ready time limit and will be marked as failed.')
+        #             service = match_jobid_to_service_job(pd_job.jobid, service_list)
+        #             if service:
+        #                 service.service_jobs.remove(pd_job)
+        #                 restart_job(pd_job.jobid)
+        #             continue
+
+        #     service_list.save_to_file()
+        #     logging.debug('Synchronizing changes.')
 
             # Check if the job is still running, as the backend might have crashed
             ### Commented out
@@ -461,18 +369,65 @@ def check_routine():
             logging.debug('Synchronizing changes.')
 
         # Remove the mutex file, allowing for another call to check_routine
+        return True
     except Exception as e:
         logging.error(e)
     finally:
         if lock_acquired:
             release_lock()
+    return False
 
-    return
+
+def health_check():
+    """Check the health of all active service jobs and cancel unhealthy jobs."""
+    logging.debug('Performing health check on all active service jobs.')
+
+    # Try to acquire the lock to ensure no other instance is running
+    lock_acquired = False
+    try:
+        if not acquire_lock():
+            logging.warning("Another health check process is running. Exiting.")
+            return
+        lock_acquired = True
+
+        # Read the service list from the cluster file
+        with open(os.path.join(service_dir, cluster_file), 'r') as f:
+            json_data = json.loads(f.read())
+
+        service_list = ServiceList()
+        service_list.from_json(json_data)
+        squeue_output = get_squeue_status()
+        service_list.update_service_job_from_queue(squeue_output)
+
+        # Iterate through all services and their jobs
+        for service in service_list.services:
+            for service_job in service.service_jobs:
+                if service_job.ready and service_job.host and not service_job.is_about_to_expire():
+                    # Check the health of the service job
+                    logging.debug(f'Checking health for ready job {service_job.jobid} on {service_job.host}:{service_job.port}')
+                    if check_service_job_status(service_job.host, service_job.port):
+                        logging.debug(f'Job {service_job.jobid} on {service_job.host}:{service_job.port} is healthy.')
+                    else:
+                        logging.warning(f'Job {service_job.jobid} on {service_job.host}:{service_job.port} is unhealthy. Cancelling.')
+                        cancel_job(service_job.jobid)
+                
+
+        # Save updated service list back to the file
+        service_list.save_to_file()
+        logging.debug('Health check completed.')
+
+    except Exception as e:
+        logging.error(f"Error during health check: {str(e)}")
+
+    finally:
+        if lock_acquired:
+            release_lock()
+
 
 def begin_inference(inference_id, user, app):
     """Add a new inference request"""
     try:
-        logging.info('Begin inference - ' + inference_id + ', ' + user + ', ' +  app) 
+        logging.info('Begin inference - ' + inference_id + ', ' + user + ', ' +  app)
     except Exception as e:
         logging.error(e)
     return
@@ -481,7 +436,7 @@ def begin_inference(inference_id, user, app):
 def end_inference(inference_id, user, app):
     """End a current inference request"""
     try:
-        logging.info('Ending inference - ' + inference_id + ', ' + user + ', ' +  app) 
+        logging.info('Ending inference - ' + inference_id + ', ' + user + ', ' +  app)
     except Exception as e:
         logging.error(e)
     return
@@ -495,17 +450,19 @@ def init():
     new_service_list = ServiceList()
     for service in config["services"]:
         new_service = Service()
-        new_service.type = service["type"]
+        new_service.id = service["id"]
         new_service.name = service["name"]
         new_service.sbatch_path = service["sbatch"]
         new_service.inferences_per_instance = service["inferences_per_instance"]
-        new_service.chunk_size = service["chunk_size"]
         new_service.maximum_number_instances = service["maximum_number_instances"]
         new_service.minimum_number_instances = service["minimum_number_instances"]
         new_service.job_expiry_time = service["job_expiry_time"]
         new_service.number_required_jobs = 0
         new_service.target_number_instances = 0
+        new_service.owned_by = service["owned_by"]
         new_service_list.services.append(new_service)
+        new_service.input = service.get("input", [])
+        new_service.output = service.get("output", [])
     json_data = new_service_list.to_json()
     with open(os.path.join(service_dir, cluster_file), "w") as f:
         f.write(json_data)

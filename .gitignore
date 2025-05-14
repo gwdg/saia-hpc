@@ -2,11 +2,16 @@ nohup*
 _*
 
 __pycache__/
+scheduler_core/__pycache__/
 
 old/
 
 venv/
+data/
+config/
+logs/
 
+config.json
 api.json
 models.json
 

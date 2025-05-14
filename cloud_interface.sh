@@ -26,7 +26,7 @@ if  [[ "$SSH_ORIGINAL_COMMAND" == keep-alive ]];
 then
     echo OK
     # Check if last_execution_time file exists
-    if [ -f last_update ]; then
+    if [ -f .last_update ]; then
         # Read the last execution time from the file
         last_update=$(cat .last_update)
     else
@@ -36,12 +36,21 @@ then
     # Calculate the elapsed time since the last execution
     current_time=$(date +%s)
     elapsed_time=$((current_time - last_update))
-    if [ "$elapsed_time" -ge "5" ]; then
+    if [ "$elapsed_time" -ge "10" ]; then
         if [ "$DEV_MODE" = false ]; then
-            echo "$current_time" > last_update
+            echo "$current_time" > .last_update
             ./scheduler.py check_routine
+            sleep 2
+            ./scheduler.py health_check
         fi
     fi
+    exit
+fi
+
+## Handle status requests
+if  [[ "$SSH_ORIGINAL_COMMAND" == status ]];
+then
+    echo $(cat ./services/cluster.services)
     exit
 fi
 
@@ -113,10 +122,37 @@ else
    exit
 fi
 
+# No backend running
 BACKEND_CNT=${#BACKENDS[@]}
+
+# If BACKENDS is empty, attempt to start a job on demand
 if [ "$BACKEND_CNT" -eq 0 ]; then
-  printf "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=UTF-8\r\nDate: $(date -R)\r\nServer: KISSKI\r\n\r\nModel Not Loaded\r\n"
-  exit
+  # printf "No backends available for $APP. Starting a new backend..."
+  # Call scheduler.py to start a new service job
+  $SCRIPT_DIR/scheduler.py start_service_job "$APP"
+
+  # Wait for the backend to become available
+  MAX_WAIT_TIME=5
+  SLEEP_INTERVAL=5
+  TIME_ELAPSED=0
+
+  while [ "$TIME_ELAPSED" -lt "$MAX_WAIT_TIME" ]; do
+    sleep "$SLEEP_INTERVAL"
+    TIME_ELAPSED=$((TIME_ELAPSED + SLEEP_INTERVAL))
+
+    # Reload the service file
+    source ./services/$APP.service
+    BACKEND_CNT=${#BACKENDS[@]}
+    if [ "$BACKEND_CNT" -gt 0 ]; then
+      # echo "Backend for $APP is now available."
+      break
+    fi
+  done
+
+  if [ "$BACKEND_CNT" -eq 0 ]; then
+    printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=UTF-8\r\nDate: $(date -R)\r\nServer: KISSKI\r\n\r\nModel Not Loaded. Please try again in a few minutes.\r\n"
+    exit
+  fi
 fi
 
 RANDOM_BACKEND=$((( $$ + $(date +%N) ) % BACKEND_CNT))
@@ -191,15 +227,10 @@ fi
 $SCRIPT_DIR/scheduler.py begin_inference "$INFERENCE_ID" "$USER_ID" "$APP" > /dev/null 2>&1 &
 
 if [ "$STREAM_INPUT" = false ]; then
-  if curl -i -f -N -g --connect-timeout 5 --max-time 120 --speed-limit 1 --speed-time 20 -X "$CURL_METHOD" "${curl_headers[@]/#/-H}" "$BACKEND$REQUEST_PATH" -d "@/dev/stdin" <<< "$DATA"; then
-    $SCRIPT_DIR/scheduler.py end_inference "$INFERENCE_ID" "$USER_ID" "$APP" > /dev/null 2>&1 &
-  else
-    printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=UTF-8\r\nDate: $(date -R)\r\nServer: KISSKI\r\n\r\nConnection to model broke\r\n"
-  fi
+  curl -i -s -N -g --connect-timeout 10 --max-time 3600 -X "$CURL_METHOD" "${curl_headers[@]/#/-H}" "$BACKEND$REQUEST_PATH" -d "@/dev/stdin" <<< "$DATA"
+  $SCRIPT_DIR/scheduler.py end_inference "$INFERENCE_ID" "$USER_ID" "$APP" > /dev/null 2>&1 &
 else
-  if curl -i -f -N -g --connect-timeout 5 --max-time 120 --speed-limit 1 --speed-time 20  -X "$CURL_METHOD" "${curl_headers[@]/#/-H}" "$BACKEND$REQUEST_PATH" -T - ; then
-    $SCRIPT_DIR/scheduler.py end_inference "$INFERENCE_ID" "$USER_ID" "$APP" > /dev/null 2>&1 &
-  else
-    printf "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html; charset=UTF-8\r\nDate: $(date -R)\r\nServer: KISSKI\r\n\r\nConnection to model broke\r\n"
-  fi
+  curl -i -s -N -g --connect-timeout 10 --max-time 3600 -X "$CURL_METHOD" "${curl_headers[@]/#/-H}" "$BACKEND$REQUEST_PATH" -T - 
+  $SCRIPT_DIR/scheduler.py end_inference "$INFERENCE_ID" "$USER_ID" "$APP" > /dev/null 2>&1 &
 fi
+

@@ -1,12 +1,14 @@
 {
     "services": [
         {
-            "name": "example-service",
-            "type": "LLM",
+            "name": "Example Service",
+            "id": "example-service",
+            "owned_by": "gwdg-examples",
+            "input": ["text"],
+            "output": ["text"],
             "sbatch": "./sbatch/example-service.sbatch",
-            "chunk_size": 8,
             "inferences_per_instance": 1,
-            "maximum_number_instances": 10,
+            "maximum_number_instances": 3,
             "minimum_number_instances": 1,
             "job_expiry_time": "9:00"
         }

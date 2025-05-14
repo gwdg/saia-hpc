@@ -19,7 +19,6 @@ Together these repos provide the entire underyling mechanism for Chat AI, which 
 
 This repository contains the tools and scripts to deploy a consistent and scalable service on a Slurm-based HPC center with the ability to integrate with the web server provided in <a href="https://github.com/gwdg/saia-hub">SAIA Hub</a>.
 
-
 ### SSH-based proxy
 
 In a typical HPC cluster setting, the high-performance compute nodes that are capable of running Large Language Models (LLMs) may not be directly accessible from the internet. In these circumstances, the requests from the web server would have to go through an entry point to the cluster, for example a login node or service node. Furthermore, direct tunneling and port forwarding may be forbidden as a security mechanism, and only certain protocols such as SSH may be allowed.
@@ -27,13 +26,12 @@ In a typical HPC cluster setting, the high-performance compute nodes that are ca
 Therefore, the HPC proxy runs on the cloud server and uses an SSH key to establish a connection to the cluster's entrypoint, i.e. the login/service node. For security reasons, the SSH key hosted on the cloud server is restricted to always run a single script on the login node, namely `cloud_interface.sh` and is never actually given a shell instance. This prevents direct access to the cluster even if the web server is compromised. The restriction to run this script is implemented by configuring the ForceCommand directive in SSH for this specific SSH key; this can be set in the `~/.ssh/authorized_keys` file of an HPC user or functional account without root access, like this:
 
 ```bash
-command="/path/to/cloud_interface.sh" ssh-rsa <public_key>
+command="/path/to/cloud_interface.sh",no-port-forwarding,no-X11-forwarding ssh-rsa <public_key>
 ```
 
 ### Scheduler
 
 The task of the scheduler script `scheduler.py` is to run reliable and scalable HPC services on a Slurm-based HPC cluster. A configuration for the desired services should be set in `config.json`, and once the scheduler is initialized with `python scheduler.py init`, everything else is done automatically.
-
 
 When an SSH proxy is running and configured to connect to the HPC center, it periodically sends keep-alive prompts to maintain the established SSH connection. Due to the ForceCommand directive, these prompts actually run the `cloud_interface.sh`, which in turn periodically runs the scheduler. The scheduler maintains the state of active backend jobs in the `services/cluster.services` file, and makes sure that there are always sufficient available jobs to handle the incoming requests, scaling up and down the jobs based on demand. It can also log timestamps of user requests which can be used for accounting purposes.
 
@@ -61,20 +59,6 @@ Initialize the cluster configuration:
 - Replace the parameters in `config.json` with your custom service setup.
 - Modify the corresponding service scripts in `sbatch/` accordingly.
 - Run `python scheduler.py init` to initialize the scheduler with `config.json`.
-
-# Known Issues
-
-### Reliability Issues
-
-- **vLLM server hangs on multi-GPU backend:** The Ray library that handles distributed GPU inference sometimes gets stuck in a phase where the server simply stops responding to any requests, resulting in timeouts. See: https://github.com/vllm-project/vllm/issues/1058#issuecomment-1768088493
-
-    The current best workaround is by changing the source code for the `vllm` package. In `vllm/engine/ray_utils.py` update the code to:
-    ```python
-        ray.init(address=ray_address,
-                     ignore_reinit_error=True,
-                     num_cpus=32, # Add this line
-                     num_gpus=parallel_config.world_size)
-    ```
     
 ## Acknowledgements
 
