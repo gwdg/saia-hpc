@@ -52,7 +52,7 @@ git clone https://github.com/gwdg/saia-hpc
 Create the SSH key on the cloud server, and add a restricted entry via ForceCommand in the `authorized_keys` file in the HPC cluster following this template:
 
 ```bash
-command="/path/to/cloud_interface.sh" ssh-rsa <public_key>
+command="/path/to/cloud_interface.sh",no-port-forwarding,no-X11-forwarding ssh-rsa <public_key>
 ``` 
 
 Initialize the cluster configuration:
